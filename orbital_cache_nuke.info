@@ -1,0 +1,6 @@
+name = Orbital Cache Nuke
+description = Coordinate cache flushing accross a remote replicate read only site
+package = "Performance"
+core = 7.x
+files[] = orbital_cache_nuke.module
+dependencies[] = elysia_cron

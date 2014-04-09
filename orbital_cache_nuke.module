@@ -1,0 +1,269 @@
+<?php
+/**
+ * @file
+ * Common settings for all Orbital Cache Nuke settings. Contact: justin.slattery@mlssoccer.com
+ */
+
+include_once 'orbital_cache_nuke.inc';
+
+/**
+ * Implements hook_permission().
+ */
+function orbital_cache_nuke_permission() {
+  return array(
+    'administer orbital cache nuke' => array(
+      'title' => t('Administer Orbital Cache Nuke')
+    )
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function orbital_cache_nuke_menu() {
+  $items = array();
+
+  // path to listen on for flush command can be changed
+  $flush_uri = variable_get('orbital_cache_nuke_flush_path');
+  $items[$flush_uri] = array(
+    'type' => MENU_CALLBACK,
+    'page callback' => 'orbital_cache_nuke_flush',
+    'access callback' => 'orbital_cache_nuke_enabled',
+  );
+
+  // OCN admin page.
+  $items['admin/config/system/orbital_cache_nuke/settings'] = array(
+    'type' => MENU_NORMAL_ITEM,
+    'title' => 'Orbital Cache Nuke',
+    'description' => 'Administer Orbital Cache Nuke',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('orbital_cache_nuke_settings'),
+    'access arguments' => array('administer orbital cache nuke settings'),
+    'file' => 'orbital_cache_nuke.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements module_cronapi() for Elysia cron
+ * Define cron jobs for system cron override and executing flush commands
+ */
+function orbital_cache_nuke_cronapi($op, $job = NULL) {
+  $items['orbital_cache_nuke_cron_execute_flush_commands'] = array(
+    'description' => 'Execute queued remote flush commands',
+    'rule' => '* * * * *', // Every minute
+  );
+
+  $items['orbital_cache_nuke_system_cron'] = array(
+    'description' => 'Run the Orbital Cache Nuke aware system_cron replacement',
+    'rule' => '5 * * * *', // Every hour
+  );
+
+  return $items;
+}
+
+/**
+ * Check to see if module is set to run
+ */
+function orbital_cache_nuke_enabled() {
+  return variable_get('orbital_cache_nuke_enabled', FALSE);
+}
+
+/**
+ * Implements hook_node_update()
+ * Add node to queue a remote cache flush any time a node is saved/updated.
+ */
+function orbital_cache_nuke_node_update($node) {
+  $queue_manager = new \OrbitalCacheNuke\QueueManager;
+  $queue_manager->queue_remote_node_cache_flush_command($node);
+}
+
+/**
+ * Helper function for global flush lock. This is used to prevent
+ * global flushes from getting called for "normal" cron triggered
+ * cache clears. There is no way to distinguish between the two, as
+ * system_cron() invokes "flush_caches" hook directly.
+ *
+ * This static variable can be set by our own system cron job and used
+ * by subsequent functions called by the flush_caches hook to avoid
+ * running.
+ */
+function &get_cron_triggered_cache_flush_static() {
+  static $cron_triggered_cache_flush;
+  return $cron_triggered_cache_flush;
+}
+
+/**
+ * Implements hook_flush_caches()
+ * Add node to queue a remote cache flush any time a node is saved/updated,
+ * unless the hook was triggered by a cron based cache flush.
+ */
+function orbital_cache_nuke_flush_caches() {
+  $cron_triggered_cache_flush = &get_cron_triggered_cache_flush_static();
+
+  if (isset($cron_triggered_cache_flush) && $cron_triggered_cache_flush) {
+    $cron_triggered_cache_flush = FALSE;
+    return;
+  }
+
+  $queue_manager = new \OrbitalCacheNuke\QueueManager;
+  $queue_manager->queue_remote_global_cache_flush_command();
+}
+
+
+/**
+ * Called by OCN's system_cron override job
+ * Queues a remote cron cache flush and then calls system_cron
+ */
+function orbital_cache_nuke_system_cron() {
+  $queue_manager = new \OrbitalCacheNuke\QueueManager;
+  $queue_manager->queue_remote_cron_cache_flush_command();
+
+  $cron_triggered_cache_flush = &get_cron_triggered_cache_flush_static();
+  $cron_triggered_cache_flush = TRUE;
+
+  system_cron();
+}
+
+/**
+ * Check for remote cache flush queue entries and trigger the remote flush
+ */
+function orbital_cache_nuke_cron_execute_flush_commands() {
+  // If module is not currently enabled, bail out
+  if (!orbital_cache_nuke_enabled()) {
+    return;
+  }
+
+  $remote_flush_url = variable_get('orbital_cache_nuke_flush_remote_url') . variable_get('orbital_cache_nuke_flush_path');
+
+  $result = db_query('select id from {orbital_cache_nuke_queue}');
+
+  if ($result->rowCount() > 0) {
+    $flushCommands = $result->fetchAll();
+
+    $options = array(
+      'method' => 'POST',
+      'data' => json_encode($flushCommands),
+      'headers' => array(
+        'Content-Type' => 'application/json',
+        'Accept' => 'application/json'
+      )
+    );
+    $response = drupal_http_request($remote_flush_url, $options);
+
+    // Remove confirmed flush requests
+    $return_value = null;
+    try {
+      $return_value = json_decode($response->data);
+    }
+    catch (Exception $e) {
+      watchdog('orbital cache nuke', 'Bad response returned from remote %remote_flush_url: %return_value', array('%return_value' => $response->data, '%remote_flush_url' => $remote_flush_url), WATCHDOG_ERROR);
+    }
+
+    if (isset($return_value) && is_array($return_value->data) && !empty($return_value->data)) {
+      $query = db_query('delete from {orbital_cache_nuke_queue} where id in (:id_list)', array(':id_list' => $return_value->data));
+    }
+    else {
+      watchdog('orbital cache nuke', 'Empty or invalid return value returned from remote %remote_flush_url: %return_value', array('%return_value' => $response->data, '%remote_flush_url' => $remote_flush_url), WATCHDOG_NOTICE);
+    }
+  }
+}
+
+
+/**
+ * Executes the cache flush on the remote server
+ */
+function orbital_cache_nuke_flush() {
+  $res = array();
+
+  // Expect a JSON encoded array of queued cache request ids
+  $json_raw = file_get_contents("php://input");
+  $requested_flush_requests = json_decode($json_raw, FALSE);
+
+  // Lookup all the cache requests the local SQL db knows about
+  $locally_known_cache_flush_requests = db_query('select id, nid from {orbital_cache_nuke_queue}')->fetchAllAssoc('id');
+
+  $flushed = array();
+  $node_flush_queue = array();
+
+  foreach ($requested_flush_requests as $request) {
+    if (array_key_exists($request->id, $locally_known_cache_flush_requests)) {
+      $nid_to_flush = $locally_known_cache_flush_requests[$request->id]->nid;
+
+      // Track that the flush command ids that are known locally by this server
+      array_push($flushed, (int)$request->id);
+
+      // Queue up the nids we need to flush
+      array_push($node_flush_queue, (int)$nid_to_flush);
+    }
+  }
+
+  // Remove duplicate nodes so we only flush once
+  $node_flush_queue = array_unique($node_flush_queue);
+
+  foreach ($node_flush_queue as $nid) {
+    // nid of -1 means to do a global flush
+    // nid of 0 means to do a system_cron partial flush
+    // nid > 0 means to flush a specific node
+    if ($nid === -1) {
+      drupal_flush_all_caches();
+    }
+    else if ($nid === 0) {
+      system_cron_slave();
+    }
+    else {
+      cache_clear_all('field:node:' . $nid, 'cache_field');
+      cache_clear_all();
+    }
+  }
+
+
+  // Return JSON response and exit
+  $res = array('status' => 'Cached flushed', 'data' => $flushed);
+  drupal_json_output($res);
+  drupal_exit();
+}
+
+/**
+ * Implements temp file cleanup and cache expiration from system_cron(). This is so
+ * that the remote servers don't try to write to the slave database and also so we
+ * can set the $cron_triggered_cache_flush variable before triggering cache_clear_all()
+ */
+function system_cron_slave() {
+  // Set the flag that lets orbital_cache_nuke_flush_caches() hook know that
+  // this was triggered by system cron flush
+  $cron_triggered_cache_flush = &get_cron_triggered_cache_flush_static();
+  $cron_triggered_cache_flush = TRUE;
+
+  $result = db_query('SELECT fid FROM {file_managed} WHERE status <> :permanent AND timestamp < :timestamp', array(
+    ':permanent' => FILE_STATUS_PERMANENT,
+    ':timestamp' => REQUEST_TIME - DRUPAL_MAXIMUM_TEMP_FILE_AGE,
+  ));
+  foreach ($result as $row) {
+    if ($file = file_load($row->fid)) {
+      $references = file_usage_list($file);
+      if (empty($references)) {
+        if (!file_delete($file)) {
+          watchdog('file system', 'Could not delete temporary file "%path" during garbage collection', array('%path' => $file->uri), WATCHDOG_ERROR);
+        }
+      }
+      else {
+        watchdog('file system', 'Did not delete temporary file "%path" during garbage collection, because it is in use by the following modules: %modules.', array('%path' => $file->uri, '%modules' => implode(', ', array_keys($references))), WATCHDOG_INFO);
+      }
+    }
+  }
+
+  $core = array(
+    'cache',
+    'cache_path',
+    'cache_filter',
+    'cache_page',
+    'cache_form',
+    'cache_menu',
+  );
+  $cache_tables = array_merge(module_invoke_all('flush_caches'), $core);
+  foreach ($cache_tables as $table) {
+    cache_clear_all(NULL, $table);
+  }
+}

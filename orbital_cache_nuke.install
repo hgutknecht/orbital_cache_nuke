@@ -1,0 +1,52 @@
+<?php
+/* @file
+ * Orbital Cache Nuke install
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function orbital_cache_nuke_schema() {
+  $schema = array();
+
+  $schema['orbital_cache_nuke_queue'] = array(
+    'description' => 'Table to store queued remote cache flush requests',
+    'fields' => array(
+      'id' => array(
+        'description' => 'Unique id for the flush request',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'nid' => array(
+        'description' => 'Node id to flush',
+        'type' => 'int',
+        'unsigned' => FALSE,
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('id'),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implements hook_iinstall().
+ */
+function orbital_cache_nuke_install() {
+  variable_set('orbital_cache_nuke_flush_url', 'http://localhost/');
+  variable_set('orbital_cache_nuke_flush_path', 'orbital_cache_nuke/flush');
+}
+
+
+/**
+ * Implements hook_uninstall().
+ */
+function orbital_cache_nuke_uninstall() {
+  $query = db_delete('variable')
+    ->condition('name', 'orbital\_cache\_nuke\_%', 'LIKE')
+    ->execute();
+
+  $drop_table = db_drop_table('orbital_cache_nuke_queue');
+}
